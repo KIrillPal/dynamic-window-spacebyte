@@ -17,6 +17,9 @@ class SpaceByteConfig(TransformerConfig):
     n_local_layers: int = None # total number of layers for both local models
     local_attention_window: int = None
 
+    # If False, skip global transformer blocks (cross-patch mixing); local blocks still run.
+    use_global_blocks: bool = True
+
     print_patches: float = 0 # fraction of time to print the patches
 
     def __post_init__(self):
@@ -178,8 +181,9 @@ class SpaceByte(Model):
                 t0 += T0
             print()
 
-        for block in self.global_blocks:
-            y = block(y, log=log)
+        if c.use_global_blocks:
+            for block in self.global_blocks:
+                y = block(y, log=log)
 
         if c.patch_method != 'periodic':
             x = torch.stack([

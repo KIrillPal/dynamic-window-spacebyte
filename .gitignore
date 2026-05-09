@@ -1,0 +1,37 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Experiment tracking & local runs
+wandb/
+
+# Training / checkpoint output dirs (pattern matches spacebyte-200M*, etc.)
+spacebyte-*/
+
+# Large local datasets (override with `git add -f` if needed)
+datasets/
+
+# Validation / baseline dumps (regenerate with validate.py)
+baseline_full.txt
+baseline_full.yaml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/

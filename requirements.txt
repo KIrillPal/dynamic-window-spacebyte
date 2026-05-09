@@ -2,6 +2,7 @@ tqdm
 zstandard
 fire
 numpy
+pyyaml
 torch>=2.0.0
 wandb
 datasets

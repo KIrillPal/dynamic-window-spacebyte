@@ -19,6 +19,8 @@ from tqdm import tqdm
 import wandb
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.nn import functional as F
 from torch.optim import Adam, NAdam, AdamW # needed for TrainConfig.optimizer
 
@@ -69,6 +71,10 @@ class TrainConfig:
     compile: bool = False
     dtype: str = None # 'float32' for no autocast. 'bfloat16' or 'float16' for autocast. 'float16' will use a GradScaler
     use_deterministic: bool = False
+    distributed: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
 
     # logging
     out_dir: str = 'out' # set to '' to disable. auto subdir unless trailing /
@@ -140,10 +146,11 @@ class Train:
         super().__init__()
         self.train_config = train_config
         c = self.train_config
+        self.is_main_process = c.rank == 0
         self._estimate_losses_dataset_iters = {}
 
         # c.out_dir might still be ''
-        if c.out_dir:
+        if c.out_dir and self.is_main_process:
             print('out_dir =', c.out_dir)
             os.makedirs(c.out_dir, exist_ok = not c.wandb_log)
             code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -162,7 +169,7 @@ class Train:
             torch.set_anomaly_enabled(True, check_nan=True)
 
         self.autocast = util.autocast_context(c.dtype)
-        self.grad_scaler = torch.cuda.amp.GradScaler(enabled = 'float16' == c.dtype)
+        self.grad_scaler = torch.amp.GradScaler('cuda', enabled = 'float16' == c.dtype)
 
         if isinstance(model_or_config, nn.Module):
             self.model = model_or_config
@@ -204,6 +211,7 @@ class Train:
             self.best_val_loss = math.inf
         mc = self.model.config
         self.model.dataset_tokenizer = self.dataset.tokenizer # useful for debugging
+        self.forward_model = self.model
 
         N = self.model.num_params()
         N_E = self.model.num_params(embedding=False)
@@ -212,7 +220,7 @@ class Train:
 
         if c.micro_batch_size is None:
             c.micro_batch_size = c.batch_size
-        assert c.batch_size % c.micro_batch_size == 0
+        assert c.batch_size % (c.micro_batch_size * c.world_size) == 0
         mB = c.micro_batch_size
 
         if isinstance(c.iters, str):
@@ -257,7 +265,7 @@ class Train:
             'train tokens': c.iters * B * T,
             'bytes per token': self.dataset.bytes_per_token,
         }
-        if verbose:
+        if verbose and self.is_main_process:
             b = {'float32': 4, 'bfloat16': 2, 'float16': 2}[c.dtype]
             print(f'total parameters: {N/1e6:,.1f}M')
             print(f'total non-embedding parameters: {N_E/1e6:,.1f}M')
@@ -279,7 +287,7 @@ class Train:
                     break
             else:
                 param_groups.append({'params': [param], 'weight_decay': weight_decay, 'lr_mult': lr_mult})
-        if verbose and len(param_groups) > 1:
+        if verbose and self.is_main_process and len(param_groups) > 1:
             for group in param_groups:
                 group = copy.copy(group)
                 group['params'] = [param.parameter_name for param in group['params']]
@@ -294,15 +302,22 @@ class Train:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
 
         if c.compile:
-            print('compiling the model...')
-            self.model = torch.compile(self.model)
+            if self.is_main_process:
+                print('compiling the model...')
+            self.forward_model = torch.compile(self.forward_model)
 
-        if c.wandb_log:
+        if c.distributed:
+            ddp_kwargs = {}
+            if 'cuda' in c.device:
+                ddp_kwargs = dict(device_ids=[torch.device(c.device).index], output_device=torch.device(c.device).index)
+            self.forward_model = DistributedDataParallel(self.forward_model, **ddp_kwargs)
+
+        if c.wandb_log and self.is_main_process:
             wandb.init( project=c.wandb_project, name=c.wandb_run_name, save_code=True, # reinit=True,
                 config=dataclasses.asdict(mc) | dataclasses.asdict(c) | self.meta )
             print()
 
-        if verbose:
+        if verbose and self.is_main_process:
             for k, v in dataclasses.asdict(mc).items():
                 print(f'{k} = {v}')
             print()
@@ -315,15 +330,17 @@ class Train:
         mc = self.model.config
         if dataset is None:
             dataset = self.dataset
-        kwargs = dict(context_size=mc.context_size, batch_size=c.micro_batch_size, seed=c.data_seed, device=c.device) | kwargs
+        seed = c.data_seed + (c.rank if split == 'train' else 0)
+        kwargs = dict(context_size=mc.context_size, batch_size=c.micro_batch_size, seed=seed, device=c.device) | kwargs
         return dataset.iter(split, **kwargs)
 
     def train(self, callback=None):
         c = self.train_config
         mc = self.model.config
 
-        print(f'tokens todo: {(c.iters-self.iter_num) * c.batch_size * mc.context_size:.4g}')
-        print(f'FLOPs todo: {(c.iters-self.iter_num) * c.batch_size * self.model.n_flops(average=True):.4g}\n')
+        if self.is_main_process:
+            print(f'tokens todo: {(c.iters-self.iter_num) * c.batch_size * mc.context_size:.4g}')
+            print(f'FLOPs todo: {(c.iters-self.iter_num) * c.batch_size * self.model.n_flops(average=True):.4g}\n')
 
         # if c.wandb_log:
             # wandb.watch(self.model, log_freq=c.eval_interval)
@@ -343,10 +360,11 @@ class Train:
 
         for iter_num in range(self.iter_num, c.iters):
             self.iter_num = iter_num
-            self.model.train()
+            self.forward_model.train()
             model_flags = self.model.next_iter(iter_num / c.iters)
-            if model_flags['warmup_lr_again']:
+            if model_flags['warmup_lr_again'] and self.is_main_process:
                 print('Train: warmup_lr_again')
+            if model_flags['warmup_lr_again']:
                 self.decay_lr_from_iter = self.iter_num
 
             lr = c.lr
@@ -369,22 +387,28 @@ class Train:
             run_eval = c.final_eval_iters > 0 if final_iter else \
                 c.eval_iters > 0 and c.eval_interval > 0 and iter_num % c.eval_interval == 0 and iter_num > 0
 
-            n_micro_batches = util.int_div(c.batch_size, c.micro_batch_size)
+            n_micro_batches = util.int_div(c.batch_size, c.micro_batch_size * c.world_size)
             for b in range(n_micro_batches):
                 tokens, targets = next_tokens
                 model_log = None # {} if run_eval and b+1 == n_micro_batches else None
-                with self.autocast:
-                    _, losses = self.model(tokens, targets, log=model_log)
-                loss = losses['loss']
+                sync_gradients = b + 1 == n_micro_batches
+                no_sync = self.forward_model.no_sync if c.distributed and not sync_gradients else contextlib.nullcontext
+                with no_sync():
+                    with self.autocast:
+                        _, losses = self.forward_model(tokens, targets, log=model_log)
+                    loss = losses['loss']
+                    if c.distributed:
+                        # DDP averages gradients across ranks; restore the single-process
+                        # gradient scale for the same global batch_size.
+                        loss = loss * c.world_size
+                    if c.checkpoint_nan and math.isnan(loss):
+                        if c.out_dir and self.is_main_process:
+                            self.checkpoint(c.out_dir + '_nan')
+                        raise Exception('nan')
+
+                    self.grad_scaler.scale(loss).backward()
 
                 next_tokens = next(data_iter)
-
-                if c.checkpoint_nan and math.isnan(loss):
-                    if c.out_dir:
-                        self.checkpoint(c.out_dir + '_nan')
-                    raise Exception('nan')
-
-                self.grad_scaler.scale(loss).backward()
 
             if c.grad_clip > 0:
                 self.grad_scaler.unscale_(self.optimizer)
@@ -403,10 +427,10 @@ class Train:
 
             flops = c.batch_size * self.model.n_flops()
             self.total_flops += flops
-            self.total_tokens += n_micro_batches * tokens.numel()
+            self.total_tokens += n_micro_batches * tokens.numel() * c.world_size
 
             t1 = time.time()
-            print_stats = run_eval or t1 - last_log_time > c.log_interval or iter_num == 0
+            print_stats = self.is_main_process and (run_eval or t1 - last_log_time > c.log_interval or iter_num == 0)
             if print_stats:
                 dt = (t1 - last_log_time) / (iter_num - last_log_iter)
                 last_log_time = t1
@@ -434,81 +458,85 @@ class Train:
 
             # evaluate the loss, log, and write checkpoints
             if run_eval:
-                util.synchronize_device(c.device)
-                util.empty_cache(c.device)
-                eval_start_time = time.time()
-                self.train_time += eval_start_time - train_time_t0
+                if self.is_main_process:
+                    util.synchronize_device(c.device)
+                    util.empty_cache(c.device)
+                    eval_start_time = time.time()
+                    self.train_time += eval_start_time - train_time_t0
 
-                ideally_val = 'val' if 'val' in self.dataset.splits() else 'train'
-                if not final_iter:
-                    eval_iters = c.eval_iters
-                else:
-                    eval_iters = c.final_eval_iters
-                splits = self.dataset.splits()
-                split_losses = self.estimate_losses(eval_iters, splits, continue_iter=not final_iter)
+                    ideally_val = 'val' if 'val' in self.dataset.splits() else 'train'
+                    if not final_iter:
+                        eval_iters = c.eval_iters
+                    else:
+                        eval_iters = c.final_eval_iters
+                    splits = self.dataset.splits()
+                    split_losses = self.estimate_losses(eval_iters, splits, continue_iter=not final_iter)
 
-                util.synchronize_device(c.device)
-                eval_dt = time.time() - eval_start_time
-                self.eval_time += eval_dt
+                    util.synchronize_device(c.device)
+                    eval_dt = time.time() - eval_start_time
+                    self.eval_time += eval_dt
 
-                print(f'\neval iter {iter_num}: {eval_dt*1000:,.0f}ms')
-                sorted_losses = list(split_losses[ideally_val].items())
-                sorted_losses.sort()
-                print( f'{ideally_val} losses:',
-                        ', '.join(f'{name} {loss:.4g}' for name, loss in sorted_losses if isinstance(loss, float)) )
-                print()
+                    print(f'\neval iter {iter_num}: {eval_dt*1000:,.0f}ms')
+                    sorted_losses = list(split_losses[ideally_val].items())
+                    sorted_losses.sort()
+                    print( f'{ideally_val} losses:',
+                            ', '.join(f'{name} {loss:.4g}' for name, loss in sorted_losses if isinstance(loss, float)) )
+                    print()
 
-                if c.wandb_log:
-                    wandb_losses = { f'{split} {name}': loss
-                               for split, losses in split_losses.items()
-                               for name, loss in losses.items()
-                               if 'token_XE' not in name or final_iter }
-                    final_losses = {f'final {name}': loss for name, loss in split_losses.items()} if final_iter else {}
-                    checkpoint_dict = { var.replace('_', ' '): getattr(self, var)
-                        for var in self.checkpoint_vars if var != 'iter_num' }
-                    wandb_dict = {
-                            'iter': iter_num,
-                            'lr': lr,
-                            'FLOP/s': flops,
-                            'TFLOP/s': flops / 1e12,
-                            'eta': eta,
-                            'trained percent': 100*iter_num/c.iters,
-                            } | checkpoint_dict | wandb_losses | final_losses | (model_log or {})
-                    try:
-                        wandb.log(wandb_dict)
-                    except Exception as e:
-                        print('\nwandb.log Exception:', e)
-                        print('wandb_dict = ', wandb_dict)
-                        print()
+                    if c.wandb_log:
+                        wandb_losses = { f'{split} {name}': loss
+                                   for split, losses in split_losses.items()
+                                   for name, loss in losses.items()
+                                   if 'token_XE' not in name or final_iter }
+                        final_losses = {f'final {name}': loss for name, loss in split_losses.items()} if final_iter else {}
+                        checkpoint_dict = { var.replace('_', ' '): getattr(self, var)
+                            for var in self.checkpoint_vars if var != 'iter_num' }
+                        wandb_dict = {
+                                'iter': iter_num,
+                                'lr': lr,
+                                'FLOP/s': flops,
+                                'TFLOP/s': flops / 1e12,
+                                'eta': eta,
+                                'trained percent': 100*iter_num/c.iters,
+                                } | checkpoint_dict | wandb_losses | final_losses | (model_log or {})
+                        try:
+                            wandb.log(wandb_dict)
+                        except Exception as e:
+                            print('\nwandb.log Exception:', e)
+                            print('wandb_dict = ', wandb_dict)
+                            print()
 
-                loss = split_losses[ideally_val]['loss']
-                new_best = loss < self.best_val_loss
-                if new_best:
-                    self.best_val_loss = loss
-                
-                save_checkpoint = c.out_dir and c.checkpoint and ( final_iter or
-                    time.time() > last_checkpoint_time + c.min_checkpoint_interval )
-                if save_checkpoint:
-                    best_ckpt = os.path.join(c.out_dir, 'ckpt_best_loss.pt')
-                    checkpoint_dict = {'losses': split_losses}
-                    if not new_best:
-                        ckpt = os.path.join(c.out_dir, 'ckpt.pt')
-                        if os.path.exists(ckpt):
-                            shutil.move(ckpt, best_ckpt)
-                    self.checkpoint(c.out_dir, checkpoint_dict)
-                    last_checkpoint_time = time.time()
+                    loss = split_losses[ideally_val]['loss']
+                    new_best = loss < self.best_val_loss
+                    if new_best:
+                        self.best_val_loss = loss
                     
-                    if (new_best or final_iter) and os.path.exists(best_ckpt):
-                        os.remove(best_ckpt)
+                    save_checkpoint = c.out_dir and c.checkpoint and ( final_iter or
+                        time.time() > last_checkpoint_time + c.min_checkpoint_interval )
+                    if save_checkpoint:
+                        best_ckpt = os.path.join(c.out_dir, 'ckpt_best_loss.pt')
+                        checkpoint_dict = {'losses': split_losses}
+                        if not new_best:
+                            ckpt = os.path.join(c.out_dir, 'ckpt.pt')
+                            if os.path.exists(ckpt):
+                                shutil.move(ckpt, best_ckpt)
+                        self.checkpoint(c.out_dir, checkpoint_dict)
+                        last_checkpoint_time = time.time()
 
-                util.empty_cache(c.device)
-                train_time_t0 = time.time()
-                last_log_time = time.time()
+                        if (new_best or final_iter) and os.path.exists(best_ckpt):
+                            os.remove(best_ckpt)
 
-            if c.out_dir and (Path(c.out_dir) / 'STOP').exists():
+                    util.empty_cache(c.device)
+                    train_time_t0 = time.time()
+                    last_log_time = time.time()
+
+                if c.distributed:
+                    dist.barrier()
+
+            if c.out_dir and self.is_main_process and (Path(c.out_dir) / 'STOP').exists():
                 assert False, 'STOP'
 
-        if c.out_dir:
+        if c.out_dir and self.is_main_process:
             with open(os.path.join(c.out_dir, 'FINISHED_TRAINING'), 'a'):
                 pass
 
@@ -563,7 +591,9 @@ class Train:
     def config_from_args(**kwargs):
         Model = eval(kwargs.get('model', 'Transformer'))
         ModelConfig = Model.Config
-        model_config, train_config = util.make_dataclasses([ModelConfig, TrainConfig], **kwargs, args=kwargs)
+        runtime_args = {'distributed', 'rank', 'local_rank', 'world_size'}
+        logged_args = {k: v for k, v in kwargs.items() if k not in runtime_args}
+        model_config, train_config = util.make_dataclasses([ModelConfig, TrainConfig], **kwargs, args=logged_args)
         return model_config, train_config
 
     def from_args(**kwargs):
@@ -600,11 +630,14 @@ class Train:
 
         return losses
 
-def estimate_loss(dataset_iter, eval_iters, model, bytes_per_token=None, autocast=contextlib.nullcontext()):
+def estimate_loss(dataset_iter, eval_iters, model, bytes_per_token=None, autocast=contextlib.nullcontext(), desc=None):
     model.eval()
     with torch.inference_mode():
         all_losses = collections.defaultdict(util.MeanError)
-        for _ in range(eval_iters):
+        it = range(eval_iters)
+        if desc is not None:
+            it = tqdm(it, total=eval_iters, desc=desc, leave=True)
+        for _ in it:
             tokens, targets = next(dataset_iter)
             with autocast:
                 logits, losses = model(tokens, targets)
@@ -630,7 +663,35 @@ def estimate_loss(dataset_iter, eval_iters, model, bytes_per_token=None, autocas
 
 import sample
 
+def setup_distributed(kwargs):
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    if world_size == 1:
+        kwargs.setdefault('distributed', False)
+        kwargs.setdefault('rank', 0)
+        kwargs.setdefault('local_rank', 0)
+        kwargs.setdefault('world_size', 1)
+        return False
+
+    if not dist.is_initialized():
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend=backend)
+
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get('LOCAL_RANK', rank))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        if kwargs.get('device') is None or str(kwargs.get('device')).startswith('cuda'):
+            kwargs['device'] = f'cuda:{local_rank}'
+
+    kwargs['distributed'] = True
+    kwargs['rank'] = rank
+    kwargs['local_rank'] = local_rank
+    kwargs['world_size'] = world_size
+    return True
+
 def train(**kwargs):
+    setup_distributed(kwargs)
+
     class LastLine:
         def __init__(self):
             self.last = ''
@@ -715,13 +776,15 @@ def train(**kwargs):
             try:
                 trainer.train()
             except BaseException as e:
-                i = 1
-                while os.path.exists(fail_dir := f'{out_dir}_FAILED{i}'):
-                    i += 1
-                shutil.move(out_dir, fail_dir)
-                print(f'\nout_dir moved to {fail_dir}\n')
+                if trainer.is_main_process and out_dir and os.path.exists(out_dir):
+                    i = 1
+                    while os.path.exists(fail_dir := f'{out_dir}_FAILED{i}'):
+                        i += 1
+                    shutil.move(out_dir, fail_dir)
+                    print(f'\nout_dir moved to {fail_dir}\n')
 
-                trainer.tee.__del__()
+                if hasattr(trainer, 'tee'):
+                    trainer.tee.__del__()
                 raise e
 
             # if trainer.train_config.wandb_log:
