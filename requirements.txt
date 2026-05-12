@@ -9,3 +9,5 @@ datasets
 tiktoken
 sentencepiece
 flash-attn>=2.3.0
+transformers
+mlflow
